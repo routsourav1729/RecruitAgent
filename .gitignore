@@ -1,0 +1,8 @@
+# Ignore data and test directories
+data/
+run_outputs/
+output_test/
+input_test/
+groundtruth/
+issues.txt
+commands.txt

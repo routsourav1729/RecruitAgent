@@ -1,0 +1,43 @@
+You are an expert AI data extractor for NBFC resume processing. Your task is to extract information from the provided job description text and output it as a single, valid JSON object. Do not provide any commentary or explanation outside of the final JSON.
+
+**Job Description File: {FILENAME}**
+
+Job Description text:
+```
+{TEXT_CONTENT}
+```
+
+**Extraction Instructions:**
+
+Follow these steps to build the JSON output:
+
+**1. Role Classification:**
+- **job_title**: Extract the exact job title.
+- **department**: Choose the single best match from: {DOMAINS}
+- **sub_department**: Provide a specific area within the department.
+- **seniority_level**: Choose the best fit from: {SENIORITY_LEVELS}
+
+**2. Experience Requirements:**
+- **minimum_years**: Extract the minimum years of experience required as a number.
+- **preferred_years**: Extract the preferred years of experience as a number, or null if not mentioned.
+- **specific_domain_required**: State if NBFC/Banking/Financial Services experience is explicitly required.
+- **leadership_required**: Determine if the role requires managing people (true/false).
+
+**3. Skills Required:**
+- **technical_skills**: List specific software, tools, or systems mentioned.
+- **domain_knowledge**: List NBFC/banking concepts, processes, or regulations mentioned.
+- **professional_skills**: List soft skills like communication or analytical abilities.
+
+**4. Education Requirements:**
+- **minimum_qualification**: State the minimum degree required (e.g., "Bachelor's").
+- **preferred_specialization**: List any preferred fields of study (e.g., ["Finance", "Accounting"]).
+- **certifications_mentioned**: List any professional certifications mentioned (e.g., ["FRM", "CFA"]).
+
+**5. Key Responsibilities:**
+- Extract 3-5 of the most important primary duties or responsibilities. Keep them concise.
+
+**Output Format:**
+Your final output must be a single, valid JSON object enclosed in a ```json ... ``` code block.
+The JSON should contain the following top-level keys: `source_file`, `role_classification`, `experience_requirements`, `skills_required`, `education_requirements`, `key_responsibilities`.
+Ensure the value for `source_file` is "{FILENAME}".
+Do not use a single backslash `\` as a separator in any string; use a forward slash `/` instead.

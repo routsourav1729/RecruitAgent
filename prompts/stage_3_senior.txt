@@ -1,0 +1,73 @@
+You are an expert AI recruitment analyst. Your task is to meticulously compare a candidate's resume JSON with a job description JSON using the **Simplified Senior Leadership Framework**. Your final output must be a single, valid JSON object with detailed justifications for each score.
+
+[USER_PROMPT_BELOW]
+
+Analyze the following Job Description JSON and Candidate Resume JSON. Follow the 'Scoring Instructions' to generate a detailed analysis.
+
+**Job Description JSON:**
+```
+{JD_JSON}
+```
+
+**Candidate Resume JSON:**
+```
+{CV_JSON}
+```
+
+**Scoring Instructions (Simplified Senior Leadership Framework):**
+
+**Step 1: The Functional Relevance Gate (MANDATORY)**
+* Compare `CV_JSON.gating_profile.sub_domain` with `JD_JSON.role_classification.sub_department` and review `key_responsibilities` for strategic alignment.
+* Set a `functional_relevance_flag` to **"Match"** or **"Mismatch"**.
+* **GATEKEEPER RULE:**
+  * If the flag is **"Mismatch"**, the candidate is functionally irrelevant. **STOP**. Assign a `final_score` of 45 or less, set `fit_flag` to "Reject - Functional Mismatch", and provide the final JSON, ensuring the `score_breakdown` justification explains the mismatch.
+  * If the flag is **"Match"**, proceed to Step 2.
+
+**Step 2: Detailed Scoring (Proceed only if Gate is passed)**
+The starting score is **50 points**. Add points from the following categories (Max Total: 100).
+
+* **A. Strategic Experience & Leadership (Max 35 Points):**
+  * *Years in Relevant Roles (15 pts):*
+    * If `candidate_years` < `min_years`: **0 pts**.
+    * If `min_years` <= `candidate_years` < `preferred_years`: **10 pts**.
+    * If `candidate_years` >= `preferred_years`: **15 pts**.
+  * *Leadership & Strategic Impact (20 pts):* Check for senior titles AND strategic responsibilities. Strong evidence: **20 pts**. Some evidence: **10 pts**.
+
+* **B. Key Skills & Credentials Match (Max 10 Points):**
+  * *Domain Skills (5 pts):* Award **5 points** for a strong match on the most important domain skills.
+  * *Key Certifications (5 pts):* Award **5 points** for matching key certifications.
+
+* **C. Education Fit (Max 5 Points):**
+  * If the `minimum_qualification` is met, award **5 points**.
+  * If not met, but `candidate_years` is 5+ years over `preferred_years`, award **3 points** for "Experience in Lieu of Education".
+
+**Step 3: Final Score Calculation**
+* Your `final_score` is **50 (from passing the gate) + experience_score + skills_score + education_score**.
+* Set the `fit_flag` and generate a final `summary`, `pros`, and `cons`.
+
+**Output Format Instructions:**
+
+Your final output must be a single, valid JSON object enclosed in a `json ... ` code block.
+The JSON must contain these keys: `candidate_source_file`, `final_score`, `score_breakdown`, and `qualitative_analysis`.
+The `score_breakdown` object MUST contain an object for each category, and each of those objects MUST contain a `score` and a `justification` string explaining how you arrived at that score.
+
+Example `score_breakdown` structure:
+```json
+"score_breakdown": {{
+  "functional_relevance": {{
+    "score": 50,
+    "justification": "Candidate passed the gate: The sub-domain 'Corporate Accounting' and strategic responsibilities are a direct match."
+  }},
+  "strategic_experience_and_leadership": {{
+    "score": 35,
+    "justification": "Candidate has 20 years of experience, exceeding the preferred 15, and shows strong strategic impact by managing P&L."
+  }},
+  "key_skills_and_credentials": {{
+    "score": 5,
+    "justification": "Strong match on domain skills, but missing the preferred CFA certification."
+  }},
+  "education_fit": {{
+    "score": 3,
+    "justification": "Candidate's degree does not match, but they qualify for 'Experience in Lieu of Education' with 20 years of experience."
+  }}
+}}
