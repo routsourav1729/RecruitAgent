@@ -203,7 +203,9 @@ class GeminiMatcher:
             Matching result with score breakdown
         """
         candidate_file = cv_json.get("source_file", "unknown_cv")
+        print(f"\n{'='*50}")
         print(f"Matching: {candidate_file}")
+        print(f"{'='*50}")
         
         for attempt in range(self.max_retries + 1):
             if attempt > 0:
@@ -213,28 +215,49 @@ class GeminiMatcher:
             try:
                 # Create prompt
                 prompt = self._create_prompt(jd_json, cv_json)
+                prompt_length = len(prompt)
+                print(f"  Prompt length: {prompt_length} chars (~{prompt_length//4} tokens)")
                 
-                # Call Gemini API
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.1 if attempt == 0 else 0.2,
-                        "max_output_tokens": 4096,
-                    }
-                )
+                # Call Gemini API with timeout handling
+                print(f"  Sending request to Gemini API... (this may take 30-60s for large prompts)")
+                start_time = time.time()
+                
+                try:
+                    response = self.model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0.1 if attempt == 0 else 0.2,
+                            "max_output_tokens": 4096,
+                        },
+                        request_options={"timeout": 120}  # 2 minute timeout
+                    )
+                    elapsed = time.time() - start_time
+                    print(f"  ✓ Received response in {elapsed:.1f}s")
+                except Exception as api_error:
+                    elapsed = time.time() - start_time
+                    print(f"  ✗ API call failed after {elapsed:.1f}s: {str(api_error)}")
+                    raise
                 
                 # Extract JSON from response
+                print(f"  Extracting JSON from response...")
                 result = self._extract_json(response.text)
+                print(f"  JSON extracted: {list(result.keys())}")
                 
                 # Validate result
-                if self._validate_result(result):
+                print(f"  Validating result...")
+                is_valid = self._validate_result(result)
+                print(f"  Validation result: {is_valid}")
+                
+                if is_valid:
                     if attempt > 0:
                         print(f"  ✓ Success after {attempt} retries")
+                    print(f"  ✓ Match successful for {candidate_file}")
                     return result
                 
                 # Invalid result - log and retry
                 error_msg = result.get("error", "Invalid structure or missing fields")
                 print(f"  ✗ Attempt {attempt} failed: {error_msg}")
+                print(f"  Available keys in result: {list(result.keys())}")
                 
                 if attempt == self.max_retries:
                     return {
