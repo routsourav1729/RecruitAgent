@@ -4,7 +4,7 @@ import sys
 import os
 import argparse
 import shutil
-
+import json 
 def organize_pdfs_by_domain(json_file_path, source_folder, output_folder):
     """
     Organizes PDF files into subdirectories based on a JSON file.

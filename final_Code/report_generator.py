@@ -1,155 +1,358 @@
-import json
+#!/usr/bin/env python3
+"""
+Report Generator (Stage 4) - Cloud-Ready
+
+Generates Excel report from matching results.
+Returns BytesIO for Streamlit download (no disk writes).
+
+Usage from master:
+    from stages.report_generator import generate_excel_report
+    
+    # Generate report
+    excel_bytes = generate_excel_report(
+        matching_report=st.session_state.matching_report,
+        top_n=10,
+        score_above=75
+    )
+    
+    # Download in Streamlit
+    st.download_button(
+        "Download Report",
+        data=excel_bytes,
+        file_name="recruitment_report.xlsx"
+    )
+"""
+
+import io
 import pandas as pd
-import argparse
 import numpy as np
+from typing import Dict, List, Optional
 
-def generate_consolidated_report(input_json_path: str, output_excel_path: str, top_n: int = None, score_above: int = None):
+
+def _safe_list_to_string(data) -> str:
+    """Convert pros/cons to string, handling both list and string inputs."""
+    if isinstance(data, list):
+        return " | ".join(str(item) for item in data if item)
+    elif isinstance(data, str):
+        return data
+    return "N/A"
+
+
+def _safe_list_to_multiline(data) -> str:
+    """Convert pros/cons to multiline string for detailed view."""
+    if isinstance(data, list):
+        return "\n".join(f"• {item}" for item in data if item)
+    elif isinstance(data, str):
+        return f"• {data}"
+    return "N/A"
+
+
+def _detect_score_categories(candidates: List[Dict]) -> List[str]:
     """
-    Loads the final matching JSON, processes it, and generates a multi-sheet
-    consolidated Excel report for HR. This version is more robust against
-    missing data from the AI model.
+    Dynamically detect all score breakdown categories from data.
+    Returns unique category names found across all candidates.
     """
-    try:
-        with open(input_json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"FATAL ERROR: Could not read or parse input JSON file '{input_json_path}'. Error: {e}")
-        return
+    categories = set()
+    
+    for candidate in candidates:
+        if "error" in candidate:
+            continue
+        
+        breakdown = candidate.get("score_breakdown", {})
+        if isinstance(breakdown, dict):
+            categories.update(breakdown.keys())
+    
+    # Sort for consistent order (functional_relevance should be first)
+    priority = ["functional_relevance"]
+    sorted_cats = []
+    
+    for cat in priority:
+        if cat in categories:
+            sorted_cats.append(cat)
+            categories.remove(cat)
+    
+    # Add rest alphabetically
+    sorted_cats.extend(sorted(categories))
+    
+    return sorted_cats
 
-    job_title = data.get("job_title", "N/A")
-    ranked_candidates = data.get("ranked_candidates", [])
 
+def _filter_candidates(
+    candidates: List[Dict],
+    min_score: Optional[int] = None,
+    top_n: Optional[int] = None,
+    exclude_errors: bool = True
+) -> List[Dict]:
+    """
+    Filter candidates based on criteria.
+    """
+    filtered = []
+    
+    for cand in candidates:
+        # Exclude errors if requested
+        if exclude_errors and "error" in cand:
+            continue
+        
+        # Check min score
+        score = cand.get("final_score", 0)
+        if min_score is not None and isinstance(score, (int, float)):
+            if score < min_score:
+                continue
+        
+        filtered.append(cand)
+    
+    # Sort by score (descending)
+    filtered.sort(
+        key=lambda x: x.get("final_score", 0) if isinstance(x.get("final_score"), (int, float)) else 0,
+        reverse=True
+    )
+    
+    # Apply top N filter
+    if top_n is not None:
+        filtered = filtered[:top_n]
+    
+    return filtered
+
+
+def generate_excel_report(
+    matching_report: Dict,
+    top_n: Optional[int] = None,
+    score_above: Optional[int] = None
+) -> bytes:
+    """
+    Generate Excel report from matching results.
+    
+    Args:
+        matching_report: Output from Stage 3 (gemini_matcher)
+        top_n: Show only top N candidates (optional)
+        score_above: Show only candidates above this score (optional)
+        
+    Returns:
+        Excel file as bytes (BytesIO) for download
+    """
+    
+    # Extract data from report
+    job_title = matching_report.get("job_title", "N/A")
+    job_source = matching_report.get("job_description_source", "N/A")
+    seniority = matching_report.get("seniority_framework", "N/A")
+    total_processed = matching_report.get("total_candidates_processed", 0)
+    all_candidates = matching_report.get("ranked_candidates", [])
+    
+    # Separate passed and rejected candidates
     passed_candidates = []
     rejected_candidates = []
-
-    for cand in ranked_candidates:
-        # Check for errors or the rejection flag to separate candidates
-        if "error" in cand or cand.get("fit_flag") == "Reject - Functional Mismatch":
+    
+    for cand in all_candidates:
+        if "error" in cand:
             rejected_candidates.append({
-                "Candidate File": cand.get("candidate_source_file", "Unknown File"),
-                "Reason for Rejection": cand.get("error", cand.get("score_breakdown", {}).get("functional_relevance", {}).get("justification", "Functional mismatch or processing error."))
+                "Candidate File": cand.get("candidate_source_file", "Unknown"),
+                "Reason": cand.get("error", "Processing error")
+            })
+        elif cand.get("fit_flag") == "Reject - Functional Mismatch":
+            rejected_candidates.append({
+                "Candidate File": cand.get("candidate_source_file", "Unknown"),
+                "Reason": "Functional mismatch - rejected at gate"
             })
         else:
             passed_candidates.append(cand)
-
-    # --- Prepare Data for Excel Sheets ---
     
-    # 1. Dashboard Sheet Data
+    # Calculate statistics
     stats = {
         "Job Title": job_title,
-        "Total Candidates Processed": data.get("total_candidates_processed", 0),
+        "Job Description": job_source,
+        "Seniority Framework": seniority.title(),
+        "Total Candidates": total_processed,
         "Passed Functional Gate": len(passed_candidates),
-        "Rejected or Errored": len(rejected_candidates),
+        "Rejected/Errors": len(rejected_candidates)
     }
-    if passed_candidates:
-        scores = [c.get('final_score', 0) for c in passed_candidates]
-        stats["Average Score (Passed)"] = round(np.mean(scores), 2)
-        stats["Median Score (Passed)"] = int(np.median(scores))
-        stats["Highest Score"] = int(np.max(scores))
     
-    # Apply filters for the shortlist
-    shortlist_candidates = passed_candidates
-    if score_above is not None:
-        shortlist_candidates = [c for c in shortlist_candidates if c.get('final_score', 0) >= score_above]
-    if top_n is not None:
-        # Ensure sorting before taking the top N
-        shortlist_candidates.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-        shortlist_candidates = shortlist_candidates[:top_n]
-
-    dashboard_shortlist_data = [{
-        "Rank": i + 1,
-        "Candidate File": c.get("candidate_source_file"),
-        "Final Score": c.get("final_score"),
-        "Summary": c.get("qualitative_analysis", {}).get("summary", ""),
-        "Key Pros": " | ".join(c.get("qualitative_analysis", {}).get("pros", [])),
-        "Key Cons": " | ".join(c.get("qualitative_analysis", {}).get("cons", []))
-    } for i, c in enumerate(shortlist_candidates)]
-
-    # 2. Detailed Sheet Data (Robust Version)
+    if passed_candidates:
+        scores = [c.get('final_score', 0) for c in passed_candidates 
+                  if isinstance(c.get('final_score'), (int, float))]
+        if scores:
+            stats["Average Score"] = round(np.mean(scores), 1)
+            stats["Median Score"] = int(np.median(scores))
+            stats["Highest Score"] = int(np.max(scores))
+            stats["Lowest Score"] = int(np.min(scores))
+    
+    # Apply filters for shortlist
+    shortlist = _filter_candidates(
+        passed_candidates,
+        min_score=score_above,
+        top_n=top_n,
+        exclude_errors=True
+    )
+    
+    # === SHEET 1: Dashboard with Shortlist ===
+    stats_df = pd.DataFrame(list(stats.items()), columns=['Metric', 'Value'])
+    
+    shortlist_data = []
+    for i, cand in enumerate(shortlist, 1):
+        qual = cand.get("qualitative_analysis", {})
+        shortlist_data.append({
+            "Rank": i,
+            "Candidate": cand.get("candidate_source_file", "Unknown"),
+            "Score": cand.get("final_score", 0),
+            "Summary": qual.get("summary", "N/A"),
+            "Key Strengths": _safe_list_to_string(qual.get("pros", [])),
+            "Key Concerns": _safe_list_to_string(qual.get("cons", []))
+        })
+    
+    shortlist_df = pd.DataFrame(shortlist_data)
+    
+    # === SHEET 2: All Passed Candidates (Detailed) ===
     detailed_data = []
-    # Define all possible columns to ensure consistency
-    score_categories = [
-        "functional_relevance", "experience_depth_and_leadership", 
-        "strategic_experience_and_leadership", "key_skills_match", 
-        "key_skills_and_credentials", "education_and_credentials", "education_fit"
-    ]
-
-    for c in passed_candidates:
+    score_categories = _detect_score_categories(passed_candidates)
+    
+    for cand in passed_candidates:
+        qual = cand.get("qualitative_analysis", {})
+        breakdown = cand.get("score_breakdown", {})
+        
         row = {
-            "Candidate File": c.get("candidate_source_file"),
-            "Final Score": c.get("final_score"),
-            "Summary": c.get("qualitative_analysis", {}).get("summary", ""),
-            "Pros": "\n".join(c.get("qualitative_analysis", {}).get("pros", [])),
-            "Cons": "\n".join(c.get("qualitative_analysis", {}).get("cons", []))
+            "Candidate": cand.get("candidate_source_file", "Unknown"),
+            "Final Score": cand.get("final_score", 0),
+            "Summary": qual.get("summary", "N/A"),
+            "Strengths": _safe_list_to_multiline(qual.get("pros", [])),
+            "Concerns": _safe_list_to_multiline(qual.get("cons", []))
         }
         
-        score_breakdown = c.get("score_breakdown", {})
-        
-        # Safely get score and justification for each category
+        # Add score breakdown columns dynamically
         for category in score_categories:
             cat_name = category.replace('_', ' ').title()
-            details = score_breakdown.get(category, {}) # Get the sub-dictionary safely
+            cat_data = breakdown.get(category, {})
             
-            row[f"{cat_name} Score"] = details.get("score", "N/A")
-            row[f"{cat_name} Justification"] = details.get("justification", "N/A")
-            
+            if isinstance(cat_data, dict):
+                row[f"{cat_name} - Score"] = cat_data.get("score", "N/A")
+                row[f"{cat_name} - Justification"] = cat_data.get("justification", "N/A")
+            else:
+                row[f"{cat_name} - Score"] = "N/A"
+                row[f"{cat_name} - Justification"] = "N/A"
+        
         detailed_data.append(row)
-
-    # --- Create DataFrames ---
-    stats_df = pd.DataFrame(list(stats.items()), columns=['Metric', 'Value'])
-    dashboard_shortlist_df = pd.DataFrame(dashboard_shortlist_data)
+    
     detailed_df = pd.DataFrame(detailed_data)
+    
+    # === SHEET 3: Rejected Candidates ===
     rejected_df = pd.DataFrame(rejected_candidates)
-
-    # --- Write to Excel ---
-    print(f"Generating Excel report at: {output_excel_path}")
-    with pd.ExcelWriter(output_excel_path, engine='xlsxwriter') as writer:
-        # Dashboard Sheet
-        stats_df.to_excel(writer, sheet_name='Dashboard', index=False, startrow=1)
-        if not dashboard_shortlist_df.empty:
-            dashboard_shortlist_df.to_excel(writer, sheet_name='Dashboard', index=False, startrow=len(stats_df) + 4)
+    
+    # === Write to Excel (in-memory) ===
+    output = io.BytesIO()
+    
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        workbook = writer.book
         
-        workbook  = writer.book
-        worksheet = writer.sheets['Dashboard']
-        header_format = workbook.add_format({'bold': True, 'text_wrap': True, 'valign': 'top', 'fg_color': '#D7E4BC', 'border': 1})
+        # Define formats
+        header_format = workbook.add_format({
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'top',
+            'fg_color': '#4472C4',
+            'font_color': 'white',
+            'border': 1
+        })
         
-        worksheet.write('A1', 'Overall Statistics', header_format)
-        worksheet.set_column('A:B', 30)
-        if not dashboard_shortlist_df.empty:
-            worksheet.write(f'A{len(stats_df) + 4}', 'Candidate Shortlist', header_format)
-            for i, col in enumerate(dashboard_shortlist_df.columns):
-                worksheet.write(len(stats_df) + 4, i, col, header_format)
-            worksheet.set_column('C:C', 15)
-            worksheet.set_column('D:F', 50)
-
-        # Detailed Sheet
+        title_format = workbook.add_format({
+            'bold': True,
+            'font_size': 14,
+            'fg_color': '#D9E1F2',
+            'border': 1
+        })
+        
+        # === SHEET 1: Dashboard ===
+        worksheet = workbook.add_worksheet('Dashboard')
+        
+        # Write title
+        worksheet.write('A1', 'Recruitment Report - Overview', title_format)
+        worksheet.set_row(0, 20)
+        
+        # Write statistics
+        worksheet.write('A3', 'Statistics', header_format)
+        worksheet.write('B3', 'Value', header_format)
+        
+        for idx, (metric, value) in enumerate(stats.items(), start=4):
+            worksheet.write(f'A{idx}', metric)
+            worksheet.write(f'B{idx}', value)
+        
+        # Write shortlist
+        shortlist_start = len(stats) + 6
+        worksheet.write(f'A{shortlist_start}', 'Top Candidates Shortlist', title_format)
+        
+        if not shortlist_df.empty:
+            shortlist_df.to_excel(
+                writer,
+                sheet_name='Dashboard',
+                startrow=shortlist_start,
+                index=False
+            )
+            
+            # Format shortlist headers
+            for col_num, value in enumerate(shortlist_df.columns):
+                worksheet.write(shortlist_start, col_num, value, header_format)
+        
+        # Set column widths
+        worksheet.set_column('A:A', 30)
+        worksheet.set_column('B:C', 15)
+        worksheet.set_column('D:D', 50)
+        worksheet.set_column('E:F', 40)
+        
+        # === SHEET 2: Detailed View ===
         if not detailed_df.empty:
-            detailed_df.to_excel(writer, sheet_name='All Passed Candidates', index=False)
-            worksheet_detailed = writer.sheets['All Passed Candidates']
-            for i, col in enumerate(detailed_df.columns):
-                worksheet_detailed.write(0, i, col, header_format)
-            worksheet_detailed.set_column('A:E', 30)
-            worksheet_detailed.set_column('F:Z', 50)
-
-        # Rejected Sheet
+            detailed_df.to_excel(writer, sheet_name='All Candidates', index=False)
+            worksheet_detailed = writer.sheets['All Candidates']
+            
+            # Format headers
+            for col_num, value in enumerate(detailed_df.columns):
+                worksheet_detailed.write(0, col_num, value, header_format)
+            
+            # Set column widths
+            worksheet_detailed.set_column('A:A', 25)  # Candidate
+            worksheet_detailed.set_column('B:B', 12)  # Score
+            worksheet_detailed.set_column('C:C', 50)  # Summary
+            worksheet_detailed.set_column('D:E', 40)  # Strengths/Concerns
+            
+            # Score columns - narrower
+            for col_num in range(5, len(detailed_df.columns)):
+                col_name = detailed_df.columns[col_num]
+                if 'Score' in col_name:
+                    worksheet_detailed.set_column(col_num, col_num, 12)
+                else:
+                    worksheet_detailed.set_column(col_num, col_num, 50)
+        
+        # === SHEET 3: Rejected ===
         if not rejected_df.empty:
-            rejected_df.to_excel(writer, sheet_name='Rejected Candidates', index=False)
-            worksheet_rejected = writer.sheets['Rejected Candidates']
-            for i, col in enumerate(rejected_df.columns):
-                worksheet_rejected.write(0, i, col, header_format)
-            worksheet_rejected.set_column('A:B', 50)
+            rejected_df.to_excel(writer, sheet_name='Rejected', index=False)
+            worksheet_rejected = writer.sheets['Rejected']
+            
+            # Format headers
+            for col_num, value in enumerate(rejected_df.columns):
+                worksheet_rejected.write(0, col_num, value, header_format)
+            
+            worksheet_rejected.set_column('A:A', 30)
+            worksheet_rejected.set_column('B:B', 60)
+    
+    # Return bytes
+    output.seek(0)
+    return output.getvalue()
 
-    print("--- Report generation complete! ---")
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate a consolidated Excel report from the matcher's JSON output.")
-    parser.add_argument("--input_json", required=True, help="Path to the matching_report.json file.")
-    parser.add_argument("--output_file", required=True, help="Path to save the final .xlsx report.")
-    parser.add_argument("--top_n", type=int, help="Filter dashboard to show only the top N candidates.")
-    parser.add_argument("--score_above", type=int, help="Filter dashboard to show candidates with a score above this value.")
-    args = parser.parse_args()
-
-    generate_consolidated_report(args.input_json, args.output_file, args.top_n, args.score_above)
-
-if __name__ == "__main__":
-    main()
+def generate_summary_stats(matching_report: Dict) -> Dict:
+    """
+    Generate summary statistics for display in UI.
+    
+    Returns:
+        Dict with statistics for quick display
+    """
+    candidates = matching_report.get("ranked_candidates", [])
+    
+    passed = [c for c in candidates if "error" not in c and c.get("fit_flag") != "Reject - Functional Mismatch"]
+    rejected = len(candidates) - len(passed)
+    
+    scores = [c.get('final_score', 0) for c in passed if isinstance(c.get('final_score'), (int, float))]
+    
+    return {
+        "total": len(candidates),
+        "passed": len(passed),
+        "rejected": rejected,
+        "avg_score": round(np.mean(scores), 1) if scores else 0,
+        "top_score": max(scores) if scores else 0
+    }
