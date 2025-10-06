@@ -1,202 +1,562 @@
-import google.generativeai as genai
-from pathlib import Path
-import time
-from typing import Dict, List, Optional
-import zipfile
-import io
+#!/usr/bin/env python3
+"""
+Gemini Parser (Stages 1 & 2) - Text to Structured JSON
 
-class GeminiExtractor:
+Converts raw text (from CVs or JDs) into structured JSON using Gemini API.
+Can also parse PDFs directly for the "Accurate" mode.
+
+Designed to be called by master orchestrator.
+
+Usage from master:
+    from stages.gemini_parser import GeminiParser, parse_jd, parse_cvs
+    
+    # Fast mode - from extracted text
+    jd_json = parse_jd(model, jd_text, "jd.pdf")
+    
+    # Accurate mode - direct from PDF
+    jd_json = parse_jd_from_pdf(model, jd_bytes, "jd.pdf")
+"""
+
+import json
+import re
+import time
+import google.generativeai as genai
+from typing import Dict, Optional
+from pathlib import Path
+
+
+class GeminiParser:
     """
-    Extracts text from PDFs using Gemini API.
-    Better for scanned/poor quality PDFs.
+    Parses raw text into structured JSON using Gemini API.
+    Handles both CV and JD parsing based on prompt template.
     """
     
-    def __init__(self, model: genai.GenerativeModel, delay: float = 6.0):
+    # Domain and seniority options for prompt injection
+    DOMAINS = [
+        "Sales & Business Development", 
+        "Credit & Risk Management",
+        "Finance & Accounts (F&A)", 
+        "Operations", 
+        "Technology (IT)",
+        "Human Resources (HR)", 
+        "Legal & Compliance",
+        "Marketing & Communications", 
+        "Administration & Facilities", 
+        "Other"
+    ]
+    
+    SENIORITY_LEVELS = [
+        "Entry-Level / Officer", 
+        "Team Lead / Supervisor", 
+        "Manager",
+        "Senior Manager / Lead", 
+        "Head of Department / VP", 
+        "Executive / C-Suite"
+    ]
+    
+    def __init__(
+        self, 
+        model,  # genai.GenerativeModel instance
+        prompt_file: str,
+        max_retries: int = 2,
+        delay: float = 6.0
+    ):
         """
+        Initialize parser with Gemini model and prompt template.
+        
         Args:
-            model: Pre-configured Gemini model instance
-            delay: Delay between API calls (rate limiting)
+            model: Pre-configured Gemini model instance (from master)
+            prompt_file: Path to prompt template file
+            max_retries: Number of retry attempts for failed parsing
+            delay: Delay between retries (rate limiting)
         """
         self.model = model
+        self.max_retries = max_retries
         self.delay = delay
         
-    def extract_single_pdf(self, pdf_bytes: bytes, filename: str) -> Dict[str, str]:
+        # Load and parse prompt template
+        self.prompt_template = self._load_prompt_template(prompt_file)
+        
+        print(f"GeminiParser initialized with prompt: {Path(prompt_file).name}")
+    
+    def _load_prompt_template(self, prompt_file: str) -> str:
+        """Load prompt template from file and clean formatting."""
+        try:
+            with open(prompt_file, 'r', encoding='utf-8') as f:
+                template = f.read()
+            
+            # Remove Qwen-specific markers if they exist
+            template = template.replace("[USER_PROMPT_BELOW]", "")
+            
+            # Clean up any model-specific tags
+            template = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', template, flags=re.DOTALL)
+            
+            return template.strip()
+            
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Prompt template not found: {prompt_file}")
+    
+    def _create_prompt(self, text_content: str, filename: str) -> str:
         """
-        Extract text from a single PDF using Gemini.
+        Create final prompt by filling template placeholders.
+        
+        Args:
+            text_content: Raw text from PDF extraction
+            filename: Original filename for reference
+            
+        Returns:
+            Complete prompt ready for Gemini
+        """
+        # Format domain and seniority lists
+        domains_str = ', '.join(f'"{d}"' for d in self.DOMAINS)
+        seniority_str = ', '.join(f'"{s}"' for s in self.SENIORITY_LEVELS)
+        
+        # Fill template placeholders
+        prompt = self.prompt_template.format(
+            FILENAME=filename,
+            TEXT_CONTENT=text_content,
+            DOMAINS=domains_str,
+            SENIORITY_LEVELS=seniority_str
+        )
+        
+        return prompt
+    
+    def _extract_json(self, response_text: str) -> Dict:
+        """
+        Extract JSON from Gemini's response.
+        Handles code blocks and attempts repair if needed.
+        
+        Args:
+            response_text: Raw response from Gemini
+            
+        Returns:
+            Parsed JSON dict or error dict
+        """
+        # Try to find JSON in code blocks first
+        json_match = re.search(
+            r'```(?:json)?\s*(\{.*?\})\s*```', 
+            response_text, 
+            re.DOTALL
+        )
+        
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            # Fallback: find first { to last }
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}')
+            
+            if start_idx == -1 or end_idx == -1:
+                return {
+                    "error": "No JSON object found in response",
+                    "context": response_text[:200]
+                }
+            
+            json_str = response_text[start_idx:end_idx + 1]
+        
+        # Try parsing
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            # Attempt repair
+            try:
+                repaired = self._repair_json(json_str)
+                return json.loads(repaired)
+            except json.JSONDecodeError as e:
+                return {
+                    "error": f"JSON parsing failed: {str(e)}",
+                    "context": json_str[:200] + "..."
+                }
+    
+    def _repair_json(self, json_str: str) -> str:
+        """Apply regex fixes to common JSON errors."""
+        # Fix trailing commas
+        json_str = re.sub(r',(\s*[\]}])', r'\1', json_str)
+        
+        # Fix unescaped backslashes
+        json_str = re.sub(r'\\(?![/bfnrt"\\])', '/', json_str)
+        
+        # Fix unquoted keys (best effort)
+        json_str = re.sub(
+            r'([{,]\s*)([a-zA-Z0-9_]+)(\s*:)', 
+            r'\1"\2"\3', 
+            json_str
+        )
+        
+        return json_str
+    
+    def _validate_result(self, result: Dict, is_cv: bool = True) -> bool:
+        """
+        Check if parsed result has minimum required fields.
+        
+        Args:
+            result: Parsed JSON dict
+            is_cv: True for CV parsing, False for JD parsing
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if "error" in result:
+            return False
+        
+        if not result.get("source_file"):
+            return False
+        
+        # CV-specific validation
+        if is_cv:
+            return bool(
+                result.get("candidate_name") and 
+                result.get("gating_profile")
+            )
+        
+        # JD-specific validation
+        else:
+            return bool(
+                result.get("role_classification") and 
+                result.get("key_responsibilities")
+            )
+    
+    def process_pdf(
+        self,
+        pdf_bytes: bytes,
+        filename: str,
+        is_cv: bool = True
+    ) -> Dict:
+        """
+        Process PDF directly with Gemini (no extraction step needed).
         
         Args:
             pdf_bytes: PDF file content as bytes
-            filename: Original filename (for reference)
+            filename: Original filename
+            is_cv: True for CV, False for JD
             
         Returns:
-            Dict with 'filename', 'text', 'status', 'error'
+            Structured JSON dict or error dict
         """
-        try:
-            # Upload PDF to Gemini
-            file = genai.upload_file(
-                io.BytesIO(pdf_bytes),
-                mime_type="application/pdf",
-                display_name=filename
-            )
+        import io
+        print(f"Parsing PDF directly: {filename}")
+        
+        for attempt in range(self.max_retries + 1):
+            if attempt > 0:
+                print(f"  Retry {attempt}/{self.max_retries}...")
+                time.sleep(self.delay)
             
-            # Wait for processing
-            time.sleep(2)
+            try:
+                # Upload PDF to Gemini
+                file = genai.upload_file(
+                    io.BytesIO(pdf_bytes),
+                    mime_type="application/pdf",
+                    display_name=filename
+                )
+                
+                time.sleep(2)  # Wait for processing
+                
+                # Create prompt for PDF parsing
+                prompt = self._create_prompt_for_pdf(filename)
+                
+                # Call Gemini API with PDF
+                response = self.model.generate_content(
+                    [prompt, file],
+                    generation_config={
+                        "temperature": 0.1 if attempt == 0 else 0.2,
+                        "max_output_tokens": 4096,
+                    }
+                )
+                
+                # Clean up uploaded file
+                genai.delete_file(file.name)
+                
+                # Extract JSON from response
+                result = self._extract_json(response.text)
+                
+                # Validate result
+                if self._validate_result(result, is_cv=is_cv):
+                    if attempt > 0:
+                        print(f"  ✓ Success after {attempt} retries")
+                    return result
+                
+                error_msg = result.get("error", "Invalid structure")
+                print(f"  ✗ Attempt {attempt} failed: {error_msg}")
+                
+                if attempt == self.max_retries:
+                    return {
+                        "error": f"Failed after {self.max_retries} retries",
+                        "last_error": error_msg,
+                        "filename": filename
+                    }
             
-            # Create extraction prompt
-            prompt = """Extract ALL text from this PDF document.
-
-Instructions:
-- Preserve the original structure and formatting
-- Extract text from tables in a readable format
-- Include headers, sections, and bullet points
-- Do NOT summarize or interpret - extract verbatim text only
-- If the document is scanned, use OCR to extract text
-
-Output only the raw extracted text, nothing else."""
-
-            # Generate response
-            response = self.model.generate_content([prompt, file])
-            
-            # Clean up uploaded file
-            genai.delete_file(file.name)
-            
-            # Extract text
-            extracted_text = response.text
-            
-            return {
-                "filename": filename,
-                "text": extracted_text,
-                "status": "success",
-                "error": None,
-                "length": len(extracted_text)
-            }
-            
-        except Exception as e:
-            return {
-                "filename": filename,
-                "text": "",
-                "status": "error",
-                "error": str(e),
-                "length": 0
-            }
+            except Exception as e:
+                print(f"  ✗ Exception: {str(e)}")
+                if attempt == self.max_retries:
+                    return {
+                        "error": f"Processing exception: {str(e)}",
+                        "filename": filename
+                    }
+        
+        return {"error": "Unexpected failure", "filename": filename}
     
-    def extract_multiple_pdfs(
+    def _create_prompt_for_pdf(self, filename: str) -> str:
+        """
+        Create prompt for direct PDF parsing.
+        
+        Args:
+            filename: Original filename for reference
+            
+        Returns:
+            Prompt string
+        """
+        # Format domain and seniority lists
+        domains_str = ', '.join(f'"{d}"' for d in self.DOMAINS)
+        seniority_str = ', '.join(f'"{s}"' for s in self.SENIORITY_LEVELS)
+        
+        # Use the template but replace TEXT_CONTENT placeholder with instruction
+        prompt = self.prompt_template.replace(
+            "{TEXT_CONTENT}",
+            "[Extract all text from the provided PDF document and parse it]"
+        )
+        prompt = prompt.format(
+            FILENAME=filename,
+            DOMAINS=domains_str,
+            SENIORITY_LEVELS=seniority_str
+        )
+        
+        return prompt
+    
+    def process_text(
         self, 
-        pdf_files: List[tuple], 
+        text_content: str, 
+        filename: str,
+        is_cv: bool = True
+    ) -> Dict:
+        """
+        Process a single text document and return structured JSON.
+        
+        Args:
+            text_content: Raw text from extraction stage
+            filename: Original filename
+            is_cv: True for CV, False for JD
+            
+        Returns:
+            Structured JSON dict or error dict
+        """
+        print(f"Parsing: {filename} ({len(text_content)} chars)")
+        
+        for attempt in range(self.max_retries + 1):
+            if attempt > 0:
+                print(f"  Retry {attempt}/{self.max_retries}...")
+                time.sleep(self.delay)
+            
+            try:
+                # Create prompt
+                prompt = self._create_prompt(text_content, filename)
+                
+                # Call Gemini API
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.1 if attempt == 0 else 0.2,
+                        "max_output_tokens": 4096,
+                    }
+                )
+                
+                # Extract JSON from response
+                result = self._extract_json(response.text)
+                
+                # Validate result
+                if self._validate_result(result, is_cv=is_cv):
+                    if attempt > 0:
+                        print(f"  ✓ Success after {attempt} retries")
+                    return result
+                
+                # Invalid result - log and retry
+                error_msg = result.get("error", "Invalid structure")
+                print(f"  ✗ Attempt {attempt} failed: {error_msg}")
+                
+                if attempt == self.max_retries:
+                    return {
+                        "error": f"Failed after {self.max_retries} retries",
+                        "last_error": error_msg,
+                        "filename": filename
+                    }
+            
+            except Exception as e:
+                print(f"  ✗ Exception: {str(e)}")
+                if attempt == self.max_retries:
+                    return {
+                        "error": f"Processing exception: {str(e)}",
+                        "filename": filename
+                    }
+        
+        return {"error": "Unexpected failure", "filename": filename}
+    
+    def process_multiple(
+        self,
+        text_dict: Dict[str, str],
+        is_cv: bool = True,
         progress_callback=None
     ) -> Dict[str, Dict]:
         """
-        Extract text from multiple PDFs.
+        Process multiple text documents in batch.
         
         Args:
-            pdf_files: List of (filename, bytes) tuples
+            text_dict: Dict mapping filename -> text content
+            is_cv: True for CVs, False for JDs
             progress_callback: Optional callback(current, total, filename)
             
         Returns:
-            Dict mapping filename to extraction result
+            Dict mapping filename -> JSON result
         """
         results = {}
-        total = len(pdf_files)
+        total = len(text_dict)
         
-        for idx, (filename, pdf_bytes) in enumerate(pdf_files, 1):
+        for idx, (filename, text_content) in enumerate(text_dict.items(), 1):
             if progress_callback:
                 progress_callback(idx, total, filename)
             
-            result = self.extract_single_pdf(pdf_bytes, filename)
+            result = self.process_text(text_content, filename, is_cv=is_cv)
             results[filename] = result
             
-            # Rate limiting (except for last file)
+            # Rate limiting between requests
             if idx < total:
                 time.sleep(self.delay)
         
         return results
-    
-    def extract_from_zip(
-        self, 
-        zip_bytes: bytes,
-        progress_callback=None
-    ) -> Dict[str, Dict]:
-        """
-        Extract PDFs from a ZIP file and process them.
-        
-        Args:
-            zip_bytes: ZIP file content as bytes
-            progress_callback: Optional callback function
-            
-        Returns:
-            Dict mapping filename to extraction result
-        """
-        pdf_files = []
-        
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zip_ref:
-                for file_info in zip_ref.filelist:
-                    # Skip directories and non-PDF files
-                    if file_info.is_dir():
-                        continue
-                    if not file_info.filename.lower().endswith('.pdf'):
-                        continue
-                    
-                    # Extract PDF
-                    pdf_bytes = zip_ref.read(file_info.filename)
-                    filename = Path(file_info.filename).name
-                    pdf_files.append((filename, pdf_bytes))
-            
-            if not pdf_files:
-                raise ValueError("No PDF files found in ZIP")
-            
-            # Process all PDFs
-            return self.extract_multiple_pdfs(pdf_files, progress_callback)
-            
-        except Exception as e:
-            return {
-                "error": {
-                    "filename": "zip_extraction",
-                    "text": "",
-                    "status": "error",
-                    "error": f"Failed to process ZIP: {str(e)}",
-                    "length": 0
-                }
-            }
 
 
-def extract_with_gemini(
-    model: genai.GenerativeModel,
-    jd_file: Optional[bytes] = None,
-    cv_files: Optional[List[tuple]] = None,
-    cv_zip: Optional[bytes] = None,
-    progress_callback=None
-) -> tuple:
+# Convenience functions for master orchestrator
+
+def parse_jd(
+    model,
+    jd_text: str,
+    jd_filename: str = "job_description.pdf",
+    prompt_file: str = "prompts/stage_1_2.txt"
+) -> Dict:
     """
-    Convenience function for extraction in master pipeline.
+    Parse a single Job Description from extracted text.
     
     Args:
         model: Gemini model instance
-        jd_file: JD PDF bytes (optional)
-        cv_files: List of (filename, bytes) tuples (optional)
-        cv_zip: ZIP file bytes containing CVs (optional)
-        progress_callback: Progress callback function
-    
+        jd_text: Extracted JD text
+        jd_filename: Original filename
+        prompt_file: Path to JD parsing prompt
+        
     Returns:
-        (jd_result, cv_results) tuple
+        Structured JD JSON
     """
-    extractor = GeminiExtractor(model=model)
+    parser = GeminiParser(model=model, prompt_file=prompt_file)
+    return parser.process_text(jd_text, jd_filename, is_cv=False)
+
+
+def parse_jd_from_pdf(
+    model,
+    jd_bytes: bytes,
+    jd_filename: str = "job_description.pdf",
+    prompt_file: str = "prompts/stage_1_2.txt"
+) -> Dict:
+    """
+    Parse a single Job Description directly from PDF.
     
-    jd_result = None
-    cv_results = {}
+    Args:
+        model: Gemini model instance
+        jd_bytes: PDF file as bytes
+        jd_filename: Original filename
+        prompt_file: Path to JD parsing prompt
+        
+    Returns:
+        Structured JD JSON
+    """
+    parser = GeminiParser(model=model, prompt_file=prompt_file)
+    return parser.process_pdf(jd_bytes, jd_filename, is_cv=False)
+
+
+def parse_cvs(
+    model,
+    cv_texts: Dict[str, str],
+    prompt_file: str = "prompts/stage_1_1.txt",
+    progress_callback=None
+) -> Dict[str, Dict]:
+    """
+    Parse multiple CVs from extracted text in batch.
     
-    # Extract JD
-    if jd_file:
+    Args:
+        model: Gemini model instance
+        cv_texts: Dict of {filename: text_content}
+        prompt_file: Path to CV parsing prompt
+        progress_callback: Optional progress function
+        
+    Returns:
+        Dict of {filename: structured_json}
+    """
+    parser = GeminiParser(model=model, prompt_file=prompt_file)
+    return parser.process_multiple(
+        cv_texts, 
+        is_cv=True, 
+        progress_callback=progress_callback
+    )
+
+
+def parse_cvs_from_pdfs(
+    model,
+    cv_pdfs: Dict[str, bytes],
+    prompt_file: str = "prompts/stage_1_1.txt",
+    progress_callback=None
+) -> Dict[str, Dict]:
+    """
+    Parse multiple CVs directly from PDFs in batch.
+    
+    Args:
+        model: Gemini model instance
+        cv_pdfs: Dict of {filename: pdf_bytes}
+        prompt_file: Path to CV parsing prompt
+        progress_callback: Optional progress function
+        
+    Returns:
+        Dict of {filename: structured_json}
+    """
+    parser = GeminiParser(model=model, prompt_file=prompt_file)
+    results = {}
+    total = len(cv_pdfs)
+    
+    for idx, (filename, pdf_bytes) in enumerate(cv_pdfs.items(), 1):
         if progress_callback:
-            progress_callback(0, 1, "Extracting Job Description...")
-        jd_result = extractor.extract_single_pdf(jd_file, "job_description.pdf")
+            progress_callback(idx, total, filename)
+        
+        result = parser.process_pdf(pdf_bytes, filename, is_cv=True)
+        results[filename] = result
+        
+        # Rate limiting between requests
+        if idx < total:
+            time.sleep(parser.delay)
     
-    # Extract CVs
-    if cv_zip:
-        if progress_callback:
-            progress_callback(0, 1, "Extracting CVs from ZIP...")
-        cv_results = extractor.extract_from_zip(cv_zip, progress_callback)
-    elif cv_files:
-        cv_results = extractor.extract_multiple_pdfs(cv_files, progress_callback)
+    return results
+
+
+def parse_all(
+    model,
+    jd_text: str,
+    cv_texts: Dict[str, str],
+    jd_filename: str = "job_description.pdf",
+    progress_callback=None
+) -> tuple:
+    """
+    Convenience function to parse JD + all CVs.
     
-    return jd_result, cv_results
+    Args:
+        model: Gemini model instance
+        jd_text: JD text content
+        cv_texts: Dict of CV texts
+        jd_filename: JD filename
+        progress_callback: Progress callback
+        
+    Returns:
+        (jd_json, cv_jsons_dict) tuple
+    """
+    # Parse JD
+    if progress_callback:
+        progress_callback(0, 1, "Parsing Job Description...")
+    jd_json = parse_jd(model, jd_text, jd_filename)
+    
+    # Parse CVs
+    cv_jsons = parse_cvs(model, cv_texts, progress_callback=progress_callback)
+    
+    return jd_json, cv_jsons

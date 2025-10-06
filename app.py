@@ -15,8 +15,7 @@ from datetime import datetime
 
 # Import all stages
 from stages.local_pdf_extractor import extract_jd, extract_cvs, extract_cvs_from_zip
-from stages.gemini_extractor import extract_with_gemini
-from stages.gemini_parser import parse_jd, parse_cvs
+from stages.gemini_parser import parse_jd, parse_cvs, parse_jd_from_pdf, parse_cvs_from_pdfs
 from stages.gemini_matcher import match_candidates
 from stages.report_generator import generate_excel_report, generate_summary_stats
 
@@ -202,12 +201,15 @@ def main():
             progress_container = st.container()
             
             with progress_container:
-                # STAGE 0: Extraction
-                with st.expander("📄 Stage 0: PDF Text Extraction", expanded=True):
-                    stage0_status = st.empty()
-                    stage0_progress = st.progress(0)
+                
+                if st.session_state.extraction_method == "⚡ Fast (Local Processing)":
+                    # FAST OPTION: Stage 0 → Extract text, then Stage 1-2 → Parse text
                     
-                    if st.session_state.extraction_method == "⚡ Fast (Local Processing)":
+                    # STAGE 0: Extraction
+                    with st.expander("📄 Stage 0: PDF Text Extraction", expanded=True):
+                        stage0_status = st.empty()
+                        stage0_progress = st.progress(0)
+                        
                         stage0_status.info("Using local extraction (fast)...")
                         
                         # Extract JD
@@ -231,56 +233,86 @@ def main():
                             )
                         stage0_progress.progress(100)
                         
-                    else:  # Gemini extraction
-                        stage0_status.info("Using Gemini AI extraction (accurate)...")
+                        # Store extracted text
+                        st.session_state.jd_text = jd_result['text']
+                        st.session_state.cv_texts = {k: v['text'] for k, v in cv_results.items() if 'text' in v}
                         
-                        jd_bytes = st.session_state.jd_file.read()
+                        stage0_status.success(f"✓ Extracted 1 JD + {len(st.session_state.cv_texts)} CVs")
+                    
+                    # STAGE 1-2: Parsing from TEXT
+                    with st.expander("🧠 Stage 1-2: Intelligent Parsing", expanded=True):
+                        stage12_status = st.empty()
+                        stage12_progress = st.progress(0)
                         
-                        if st.session_state.cv_option == "ZIP File":
-                            jd_result, cv_results = extract_with_gemini(
-                                model=model,
-                                jd_file=jd_bytes,
-                                cv_zip=st.session_state.cv_zip.read(),
-                                progress_callback=lambda i, t, f: stage0_status.text(f"Extracting {i}/{t}: {f}")
-                            )
-                        else:
-                            cv_file_tuples = [(f.name, f.read()) for f in st.session_state.cv_files]
-                            jd_result, cv_results = extract_with_gemini(
-                                model=model,
-                                jd_file=jd_bytes,
-                                cv_files=cv_file_tuples,
-                                progress_callback=lambda i, t, f: stage0_status.text(f"Extracting {i}/{t}: {f}")
-                            )
-                        stage0_progress.progress(100)
-                    
-                    # Store in session
-                    st.session_state.jd_text = jd_result['text']
-                    st.session_state.cv_texts = {k: v['text'] for k, v in cv_results.items() if 'text' in v}
-                    
-                    stage0_status.success(f"✓ Extracted 1 JD + {len(st.session_state.cv_texts)} CVs")
+                        stage12_status.info("Parsing Job Description from text...")
+                        st.session_state.jd_json = parse_jd(
+                            model=model,
+                            jd_text=st.session_state.jd_text,
+                            jd_filename=st.session_state.jd_file.name
+                        )
+                        stage12_progress.progress(30)
+                        
+                        stage12_status.info(f"Parsing {len(st.session_state.cv_texts)} CVs from text...")
+                        st.session_state.cv_jsons = parse_cvs(
+                            model=model,
+                            cv_texts=st.session_state.cv_texts,
+                            progress_callback=lambda i, t, f: stage12_status.text(f"Parsing {i}/{t}: {f}")
+                        )
+                        stage12_progress.progress(100)
+                        
+                        stage12_status.success("✓ Parsing complete")
                 
-                # STAGE 1-2: Parsing
-                with st.expander("🧠 Stage 1-2: Intelligent Parsing", expanded=True):
-                    stage12_status = st.empty()
-                    stage12_progress = st.progress(0)
+                else:
+                    # ACCURATE OPTION: Parse PDFs directly (no extraction stage)
                     
-                    stage12_status.info("Parsing Job Description...")
-                    st.session_state.jd_json = parse_jd(
-                        model=model,
-                        jd_text=st.session_state.jd_text,
-                        jd_filename=st.session_state.jd_file.name
-                    )
-                    stage12_progress.progress(30)
-                    
-                    stage12_status.info(f"Parsing {len(st.session_state.cv_texts)} CVs...")
-                    st.session_state.cv_jsons = parse_cvs(
-                        model=model,
-                        cv_texts=st.session_state.cv_texts,
-                        progress_callback=lambda i, t, f: stage12_status.text(f"Parsing {i}/{t}: {f}")
-                    )
-                    stage12_progress.progress(100)
-                    
-                    stage12_status.success("✓ Parsing complete")
+                    with st.expander("🎯 Stage 1-2: Direct PDF Parsing with Gemini", expanded=True):
+                        stage12_status = st.empty()
+                        stage12_progress = st.progress(0)
+                        
+                        stage12_status.info("Parsing Job Description PDF directly...")
+                        jd_bytes = st.session_state.jd_file.read()
+                        st.session_state.jd_json = parse_jd_from_pdf(
+                            model=model,
+                            jd_bytes=jd_bytes,
+                            jd_filename=st.session_state.jd_file.name
+                        )
+                        stage12_progress.progress(30)
+                        
+                        # Prepare CV PDFs
+                        cv_pdfs = {}
+                        if st.session_state.cv_option == "ZIP File":
+                            import zipfile
+                            import io
+                            from pathlib import Path
+                            
+                            stage12_status.info("Extracting PDFs from ZIP...")
+                            with zipfile.ZipFile(io.BytesIO(st.session_state.cv_zip.read()), 'r') as zip_ref:
+                                for file_info in zip_ref.filelist:
+                                    if file_info.is_dir():
+                                        continue
+                                    if not file_info.filename.lower().endswith('.pdf'):
+                                        continue
+                                    
+                                    pdf_bytes = zip_ref.read(file_info.filename)
+                                    filename = Path(file_info.filename).name
+                                    cv_pdfs[filename] = pdf_bytes
+                        else:
+                            for f in st.session_state.cv_files:
+                                cv_pdfs[f.name] = f.read()
+                        
+                        stage12_status.info(f"Parsing {len(cv_pdfs)} CV PDFs directly...")
+                        st.session_state.cv_jsons = parse_cvs_from_pdfs(
+                            model=model,
+                            cv_pdfs=cv_pdfs,
+                            progress_callback=lambda i, t, f: stage12_status.text(f"Parsing PDF {i}/{t}: {f}")
+                        )
+                        stage12_progress.progress(100)
+                        
+                        # For debug purposes, set empty text placeholders
+                        st.session_state.jd_text = "[Parsed directly from PDF - no intermediate text]"
+                        st.session_state.cv_texts = {k: "[Parsed directly from PDF]" for k in cv_pdfs.keys()}
+                        
+                        stage12_status.success("✓ Direct PDF parsing complete")
                 
                 # STAGE 3: Matching
                 with st.expander("🎯 Stage 3: AI Matching & Scoring", expanded=True):
