@@ -11,6 +11,8 @@ import streamlit as st
 import google.generativeai as genai
 import json
 import time
+import os
+from pathlib import Path
 from datetime import datetime
 
 # Import all stages
@@ -59,22 +61,49 @@ st.markdown("""
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         text-align: center;
     }
+    .info-box {
+        padding: 1rem;
+        border-radius: 5px;
+        background: #d1ecf1;
+        border: 1px solid #bee5eb;
+        color: #0c5460;
+        margin: 1rem 0;
+    }
+    .warning-box {
+        padding: 1rem;
+        border-radius: 5px;
+        background: #fff3cd;
+        border: 1px solid #ffc107;
+        color: #856404;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+# Initialize ALL session state variables at startup
+def init_session_state():
+    """Initialize all session state variables to prevent KeyError"""
+    defaults = {
+        'stage': 0,
+        'jd_text': None,
+        'cv_texts': {},
+        'jd_json': None,
+        'cv_jsons': {},
+        'matching_report': None,
+        'jd_file_content': None,
+        'jd_file_name': None,
+        'cv_files_content': None,
+        'cv_zip_content': None,
+        'extraction_method': None,
+        'seniority': None,
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
 # Initialize session state
-if 'stage' not in st.session_state:
-    st.session_state.stage = 0
-if 'jd_text' not in st.session_state:
-    st.session_state.jd_text = None
-if 'cv_texts' not in st.session_state:
-    st.session_state.cv_texts = {}
-if 'jd_json' not in st.session_state:
-    st.session_state.jd_json = None
-if 'cv_jsons' not in st.session_state:
-    st.session_state.cv_jsons = {}
-if 'matching_report' not in st.session_state:
-    st.session_state.matching_report = None
+init_session_state()
 
 
 def initialize_gemini():
@@ -88,6 +117,58 @@ def initialize_gemini():
         st.error(f"Failed to initialize Gemini API: {e}")
         st.info("Please add your GEMINI_API_KEY to Streamlit secrets.")
         st.stop()
+
+
+def load_demo_files():
+    """Load demo files from demo_data folder."""
+    demo_path = Path("demo_data")
+    
+    if not demo_path.exists():
+        st.error("Demo data folder not found. Please add demo_data/ to your project.")
+        return None, None
+    
+    # Load JD
+    jd_path = demo_path / "jd"
+    jd_files = list(jd_path.glob("*.pdf"))
+    
+    if not jd_files:
+        st.error("No demo JD found in demo_data/jd/")
+        return None, None
+    
+    jd_file = jd_files[0]  # Take first JD
+    
+    # Load CVs
+    cv_path = demo_path / "cvs"
+    cv_files = list(cv_path.glob("*.pdf"))
+    
+    if not cv_files:
+        st.error("No demo CVs found in demo_data/cvs/")
+        return None, None
+    
+    return jd_file, cv_files
+
+
+def handle_api_error(error_msg: str):
+    """Display user-friendly API error messages"""
+    if "429" in error_msg or "quota" in error_msg.lower():
+        st.error("🚫 **API Quota Exceeded**")
+        st.markdown("""
+        <div class="warning-box">
+        <strong>You've reached your daily API limit for Gemini.</strong><br><br>
+        
+        <strong>Options:</strong>
+        <ul>
+            <li>⏰ Wait 24 hours for quota reset</li>
+            <li>💳 Upgrade to paid tier at <a href="https://ai.google.dev/pricing" target="_blank">Google AI Studio</a></li>
+            <li>⚡ Use local extraction only (faster, no API calls for extraction)</li>
+        </ul>
+        
+        <strong>Tip:</strong> The free tier allows 50 requests per day. Each CV processing uses 1-2 requests.
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.error(f"❌ API Error: {error_msg}")
+        st.info("Please check your API key and try again.")
 
 
 def main():
@@ -111,95 +192,161 @@ def main():
         
         st.markdown("---")
         
-        # Report filters
+        # Report filters with clear explanation
         st.subheader("📊 Report Filters")
-        score_filter = st.slider("Minimum Score", 0, 100, 70)
-        top_n = st.number_input("Top N Candidates", 1, 50, 10)
+        st.caption("Filter results by score (0-100) **and/or** number of candidates")
+        
+        score_filter = st.slider(
+            "Minimum Score (out of 100)", 
+            0, 100, 70,
+            help="Only show candidates with score above this threshold"
+        )
+        
+        top_n = st.number_input(
+            "Maximum Number of Candidates", 
+            1, 50, 10,
+            help="Show at most this many top candidates"
+        )
         
         st.markdown("---")
         st.caption("Powered by Gemini 2.0 Flash")
     
-    # Main content tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📤 Upload", "⚙️ Process", "📊 Results", "🔍 Debug"])
-    
-    # TAB 1: UPLOAD
-    with tab1:
-        st.header("Step 1: Upload Documents")
+    # STAGE 0: UPLOAD
+    if st.session_state.stage == 0:
+        st.header("📤 Step 1: Upload Documents")
         
-        col1, col2 = st.columns(2)
+        # Demo vs Custom mode
+        st.markdown('<div class="info-box">💡 <strong>Tip:</strong> Try Demo mode first to see how it works, then switch to Custom for your own files.</div>', unsafe_allow_html=True)
         
-        with col1:
-            st.subheader("Job Description")
-            jd_file = st.file_uploader(
-                "Upload JD PDF",
-                type=['pdf'],
-                key='jd_upload',
-                help="Upload the job description PDF"
-            )
-            if jd_file:
-                st.success(f"✓ {jd_file.name} uploaded ({jd_file.size // 1024} KB)")
-        
-        with col2:
-            st.subheader("Candidate Resumes")
-            cv_option = st.radio(
-                "Upload Format",
-                ["Multiple PDFs", "ZIP File"],
-                horizontal=True
-            )
-            
-            if cv_option == "Multiple PDFs":
-                cv_files = st.file_uploader(
-                    "Upload CV PDFs",
-                    type=['pdf'],
-                    accept_multiple_files=True,
-                    key='cv_upload'
-                )
-                if cv_files:
-                    st.success(f"✓ {len(cv_files)} CVs uploaded")
-            else:
-                cv_zip = st.file_uploader(
-                    "Upload ZIP containing CVs",
-                    type=['zip'],
-                    key='zip_upload'
-                )
-                if cv_zip:
-                    st.success(f"✓ ZIP uploaded ({cv_zip.size // 1024} KB)")
-        
-        st.markdown("---")
-        
-        # Extraction method
-        st.subheader("Extraction Method")
-        extraction_method = st.radio(
-            "Choose extraction approach",
-            ["⚡ Fast (Local Processing)", "🎯 Accurate (Gemini AI)"],
+        upload_mode = st.radio(
+            "Select Mode",
+            ["🎬 Demo", "📁 Custom"],
             horizontal=True,
-            help="Fast: Instant, good for clean PDFs | Accurate: AI-powered, better for scanned/complex PDFs"
+            help="Demo: Use sample files | Custom: Upload your own files"
         )
         
-        # Process button
-        can_process = jd_file and ((cv_option == "Multiple PDFs" and cv_files) or (cv_option == "ZIP File" and cv_zip))
+        if upload_mode == "🎬 Demo":
+            st.markdown("---")
+            st.subheader("Demo Mode")
+            st.info("📋 Demo files will be loaded from `demo_data/` folder")
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write("**Demo Contents:**")
+                demo_jd, demo_cvs = load_demo_files()
+                if demo_jd and demo_cvs:
+                    st.write(f"- Job Description: `{demo_jd.name}`")
+                    st.write(f"- Resumes: {len(demo_cvs)} file(s)")
+                    for cv in demo_cvs:
+                        st.write(f"  - `{cv.name}`")
+            
+            with col2:
+                st.write("")  # Spacing
+                st.write("")  # Spacing
+                if st.button("🚀 Run Demo", type="primary", use_container_width=True):
+                    if demo_jd and demo_cvs:
+                        # Load demo files into session state
+                        with open(demo_jd, 'rb') as f:
+                            st.session_state.jd_file_content = f.read()
+                            st.session_state.jd_file_name = demo_jd.name
+                        
+                        st.session_state.cv_files_content = []
+                        for cv in demo_cvs:
+                            with open(cv, 'rb') as f:
+                                st.session_state.cv_files_content.append((cv.name, f.read()))
+                        
+                        st.session_state.cv_zip_content = None  # Not using ZIP in demo
+                        st.session_state.extraction_method = "⚡ Fast (Local Processing)"
+                        st.session_state.seniority = seniority
+                        st.session_state.stage = 1
+                        st.rerun()
+                    else:
+                        st.error("Failed to load demo files.")
         
-        if st.button("🚀 Start Processing", disabled=not can_process, type="primary", use_container_width=True):
-            st.session_state.stage = 1
-            st.session_state.jd_file = jd_file
-            st.session_state.cv_option = cv_option
-            st.session_state.cv_files = cv_files if cv_option == "Multiple PDFs" else None
-            st.session_state.cv_zip = cv_zip if cv_option == "ZIP File" else None
-            st.session_state.extraction_method = extraction_method
-            st.session_state.seniority = seniority
-            st.rerun()
+        else:  # Custom mode
+            st.markdown("---")
+            st.subheader("Custom Upload")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("##### Job Description")
+                jd_file = st.file_uploader(
+                    "Upload JD PDF",
+                    type=['pdf'],
+                    key='jd_upload',
+                    help="Upload the job description PDF file"
+                )
+                if jd_file:
+                    st.success(f"✓ {jd_file.name} ({jd_file.size // 1024} KB)")
+            
+            with col2:
+                st.markdown("##### Candidate Resumes")
+                cv_files_or_zip = st.file_uploader(
+                    "Upload CVs (Multiple PDFs or one ZIP file)",
+                    type=['pdf', 'zip'],
+                    accept_multiple_files=True,
+                    key='cv_upload',
+                    help="Upload multiple PDF files or a single ZIP file containing PDFs"
+                )
+                
+                if cv_files_or_zip:
+                    # Check if it's a ZIP or multiple PDFs
+                    if len(cv_files_or_zip) == 1 and cv_files_or_zip[0].name.endswith('.zip'):
+                        st.success(f"✓ ZIP file uploaded: {cv_files_or_zip[0].name} ({cv_files_or_zip[0].size // 1024} KB)")
+                    else:
+                        st.success(f"✓ {len(cv_files_or_zip)} PDF(s) uploaded")
+            
+            st.markdown("---")
+            
+            # Extraction method
+            st.subheader("Extraction Method")
+            extraction_method = st.radio(
+                "Choose extraction approach",
+                ["⚡ Fast (Local Processing)", "🎯 Accurate (Gemini AI)"],
+                horizontal=True,
+                help="Fast: Instant, good for clean PDFs | Accurate: AI-powered, better for scanned/complex PDFs"
+            )
+            
+            # Process button
+            can_process = jd_file and cv_files_or_zip
+            
+            if st.button("🚀 Start Processing", disabled=not can_process, type="primary", use_container_width=True):
+                # Store files in session state
+                st.session_state.jd_file_content = jd_file.read()
+                st.session_state.jd_file_name = jd_file.name
+                
+                # Handle ZIP or multiple PDFs
+                if len(cv_files_or_zip) == 1 and cv_files_or_zip[0].name.endswith('.zip'):
+                    st.session_state.cv_zip_content = cv_files_or_zip[0].read()
+                    st.session_state.cv_files_content = None
+                else:
+                    st.session_state.cv_files_content = [(f.name, f.read()) for f in cv_files_or_zip]
+                    st.session_state.cv_zip_content = None
+                
+                st.session_state.extraction_method = extraction_method
+                st.session_state.seniority = seniority
+                st.session_state.stage = 1
+                st.rerun()
     
-    # TAB 2: PROCESS
-    with tab2:
-        if st.session_state.stage >= 1:
-            st.header("Processing Pipeline")
-            
-            # Initialize Gemini
+    # STAGE 1: PROCESSING
+    elif st.session_state.stage == 1:
+        st.header("⚙️ Processing Pipeline")
+        
+        # Initialize Gemini
+        try:
             model = initialize_gemini()
-            
-            # Progress tracking
-            progress_container = st.container()
-            
+        except Exception as e:
+            st.error(f"Failed to initialize Gemini: {e}")
+            if st.button("🔄 Go Back to Upload"):
+                st.session_state.stage = 0
+                st.rerun()
+            st.stop()
+        
+        # Progress tracking
+        progress_container = st.container()
+        
+        try:
             with progress_container:
                 
                 if st.session_state.extraction_method == "⚡ Fast (Local Processing)":
@@ -214,21 +361,20 @@ def main():
                         
                         # Extract JD
                         jd_result = extract_jd(
-                            st.session_state.jd_file.read(),
-                            st.session_state.jd_file.name
+                            st.session_state.jd_file_content,
+                            st.session_state.jd_file_name
                         )
                         stage0_progress.progress(30)
                         
                         # Extract CVs
-                        if st.session_state.cv_option == "ZIP File":
+                        if st.session_state.cv_zip_content:
                             cv_results = extract_cvs_from_zip(
-                                st.session_state.cv_zip.read(),
+                                st.session_state.cv_zip_content,
                                 progress_callback=lambda i, t, f: stage0_status.text(f"Extracting {i}/{t}: {f}")
                             )
                         else:
-                            cv_file_tuples = [(f.name, f.read()) for f in st.session_state.cv_files]
                             cv_results = extract_cvs(
-                                cv_file_tuples,
+                                st.session_state.cv_files_content,
                                 progress_callback=lambda i, t, f: stage0_status.text(f"Extracting {i}/{t}: {f}")
                             )
                         stage0_progress.progress(100)
@@ -248,7 +394,7 @@ def main():
                         st.session_state.jd_json = parse_jd(
                             model=model,
                             jd_text=st.session_state.jd_text,
-                            jd_filename=st.session_state.jd_file.name
+                            jd_filename=st.session_state.jd_file_name
                         )
                         stage12_progress.progress(30)
                         
@@ -270,23 +416,22 @@ def main():
                         stage12_progress = st.progress(0)
                         
                         stage12_status.info("Parsing Job Description PDF directly...")
-                        jd_bytes = st.session_state.jd_file.read()
                         st.session_state.jd_json = parse_jd_from_pdf(
                             model=model,
-                            jd_bytes=jd_bytes,
-                            jd_filename=st.session_state.jd_file.name
+                            jd_bytes=st.session_state.jd_file_content,
+                            jd_filename=st.session_state.jd_file_name
                         )
                         stage12_progress.progress(30)
                         
                         # Prepare CV PDFs
                         cv_pdfs = {}
-                        if st.session_state.cv_option == "ZIP File":
+                        if st.session_state.cv_zip_content:
                             import zipfile
                             import io
                             from pathlib import Path
                             
                             stage12_status.info("Extracting PDFs from ZIP...")
-                            with zipfile.ZipFile(io.BytesIO(st.session_state.cv_zip.read()), 'r') as zip_ref:
+                            with zipfile.ZipFile(io.BytesIO(st.session_state.cv_zip_content), 'r') as zip_ref:
                                 for file_info in zip_ref.filelist:
                                     if file_info.is_dir():
                                         continue
@@ -297,8 +442,8 @@ def main():
                                     filename = Path(file_info.filename).name
                                     cv_pdfs[filename] = pdf_bytes
                         else:
-                            for f in st.session_state.cv_files:
-                                cv_pdfs[f.name] = f.read()
+                            for fname, fbytes in st.session_state.cv_files_content:
+                                cv_pdfs[fname] = fbytes
                         
                         stage12_status.info(f"Parsing {len(cv_pdfs)} CV PDFs directly...")
                         st.session_state.cv_jsons = parse_cvs_from_pdfs(
@@ -338,135 +483,141 @@ def main():
                 
                 # Success
                 st.balloons()
-                st.success("🎉 All stages complete! View results in the Results tab.")
+                st.success("🎉 All stages complete! Preparing results...")
+                time.sleep(2)  # Brief pause for user to see success
                 st.session_state.stage = 2
+                st.rerun()
         
-        else:
-            st.info("Upload documents in the Upload tab to begin processing.")
+        except Exception as e:
+            error_msg = str(e)
+            st.error("❌ Processing failed")
+            handle_api_error(error_msg)
+            
+            if st.button("🔄 Go Back to Upload"):
+                st.session_state.stage = 0
+                st.rerun()
+            st.stop()
     
-    # TAB 3: RESULTS
-    with tab3:
-        if st.session_state.stage >= 2:
-            st.header("📊 Analysis Results")
-            
-            # Summary stats
-            stats = generate_summary_stats(st.session_state.matching_report)
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Candidates", stats['total'])
-            with col2:
-                st.metric("Passed Gate", stats['passed'])
-            with col3:
-                st.metric("Average Score", f"{stats['avg_score']:.1f}")
-            with col4:
-                st.metric("Top Score", stats['top_score'])
-            
-            st.markdown("---")
-            
-            # Download report
-            st.subheader("📥 Download Report")
-            
-            excel_bytes = generate_excel_report(
-                matching_report=st.session_state.matching_report,
-                top_n=top_n,
-                score_above=score_filter
-            )
-            
-            job_title = st.session_state.matching_report.get('job_title', 'recruitment')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
-            st.download_button(
-                label="📥 Download Excel Report",
-                data=excel_bytes,
-                file_name=f"recruitment_report_{job_title}_{timestamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-            
-            st.markdown("---")
-            
-            # Candidate shortlist
-            st.subheader("🏆 Top Candidates")
-            
-            candidates = st.session_state.matching_report.get('ranked_candidates', [])
-            passed = [c for c in candidates if 'error' not in c and c.get('fit_flag') != 'Reject - Functional Mismatch']
-            
-            # Apply filters
-            filtered = [c for c in passed if c.get('final_score', 0) >= score_filter]
-            filtered.sort(key=lambda x: x.get('final_score', 0), reverse=True)
-            filtered = filtered[:top_n]
-            
-            if not filtered:
-                st.warning("No candidates match the selected filters.")
-            else:
-                for idx, cand in enumerate(filtered, 1):
-                    qual = cand.get('qualitative_analysis', {})
-                    score = cand.get('final_score', 0)
-                    
-                    with st.expander(f"#{idx} | {cand.get('candidate_source_file', 'Unknown')} | Score: {score}"):
-                        st.markdown(f"**Summary:** {qual.get('summary', 'N/A')}")
-                        
-                        col_a, col_b = st.columns(2)
-                        with col_a:
-                            st.markdown("**✅ Strengths:**")
-                            pros = qual.get('pros', [])
-                            if isinstance(pros, list):
-                                for pro in pros:
-                                    st.markdown(f"• {pro}")
-                            else:
-                                st.markdown(f"• {pros}")
-                        
-                        with col_b:
-                            st.markdown("**⚠️ Concerns:**")
-                            cons = qual.get('cons', [])
-                            if isinstance(cons, list):
-                                for con in cons:
-                                    st.markdown(f"• {con}")
-                            else:
-                                st.markdown(f"• {cons}")
-                        
-                        st.markdown("**Score Breakdown:**")
-                        st.json(cand.get('score_breakdown', {}))
-        else:
-            st.info("Complete processing to view results.")
-    
-    # TAB 4: DEBUG
-    with tab4:
-        st.header("🔍 Debug & Inspection")
+    # STAGE 2: RESULTS
+    elif st.session_state.stage == 2:
+        st.header("📊 Analysis Results")
         
-        if st.session_state.stage >= 2:
-            # Sample extraction
-            st.subheader("Sample Extracted Text")
-            sample_cv = list(st.session_state.cv_texts.keys())[0] if st.session_state.cv_texts else None
-            
-            if sample_cv:
-                with st.expander("📄 JD Extracted Text (first 500 chars)"):
-                    st.text(st.session_state.jd_text[:500] + "...")
+        # Download Report Section
+        st.subheader("📥 Download Report")
+        
+        excel_bytes = generate_excel_report(
+            matching_report=st.session_state.matching_report,
+            top_n=top_n,
+            score_above=score_filter
+        )
+        
+        job_title = st.session_state.matching_report.get('job_title', 'recruitment')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        st.download_button(
+            label="📥 Download Excel Report",
+            data=excel_bytes,
+            file_name=f"recruitment_report_{job_title}_{timestamp}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+        
+        st.markdown("---")
+        
+        # Summary stats
+        st.subheader("📈 Summary Statistics")
+        stats = generate_summary_stats(st.session_state.matching_report)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Candidates", stats['total'])
+        with col2:
+            st.metric("Passed Gate", stats['passed'])
+        with col3:
+            st.metric("Average Score", f"{stats['avg_score']:.1f}")
+        with col4:
+            st.metric("Top Score", stats['top_score'])
+        
+        st.markdown("---")
+        
+        # Candidate shortlist
+        st.subheader("🏆 Top Candidates")
+        
+        candidates = st.session_state.matching_report.get('ranked_candidates', [])
+        passed = [c for c in candidates if 'error' not in c and c.get('fit_flag') != 'Reject - Functional Mismatch']
+        
+        # Apply filters
+        filtered = [c for c in passed if c.get('final_score', 0) >= score_filter]
+        filtered.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+        filtered = filtered[:top_n]
+        
+        if not filtered:
+            st.warning("No candidates match the selected filters. Try adjusting the filters in the sidebar.")
+        else:
+            for idx, cand in enumerate(filtered, 1):
+                qual = cand.get('qualitative_analysis', {})
+                score = cand.get('final_score', 0)
                 
-                with st.expander(f"📄 Sample CV: {sample_cv} (first 500 chars)"):
-                    st.text(st.session_state.cv_texts[sample_cv][:500] + "...")
+                with st.expander(f"#{idx} | {cand.get('candidate_source_file', 'Unknown')} | Score: {score}"):
+                    st.markdown(f"**Summary:** {qual.get('summary', 'N/A')}")
+                    
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown("**✅ Strengths:**")
+                        pros = qual.get('pros', [])
+                        if isinstance(pros, list):
+                            for pro in pros:
+                                st.markdown(f"• {pro}")
+                        else:
+                            st.markdown(f"• {pros}")
+                    
+                    with col_b:
+                        st.markdown("**⚠️ Concerns:**")
+                        cons = qual.get('cons', [])
+                        if isinstance(cons, list):
+                            for con in cons:
+                                st.markdown(f"• {con}")
+                        else:
+                            st.markdown(f"• {cons}")
+                    
+                    st.markdown("---")
+                    st.markdown("**📊 Score Breakdown:**")
+                    breakdown = cand.get('score_breakdown', {})
+                    for category, details in breakdown.items():
+                        if isinstance(details, dict):
+                            cat_name = category.replace('_', ' ').title()
+                            cat_score = details.get('score', 'N/A')
+                            cat_just = details.get('justification', 'N/A')
+                            st.markdown(f"**{cat_name}:** {cat_score}")
+                            st.caption(cat_just)
+        
+        st.markdown("---")
+        
+        # Optional: View parsed data
+        with st.expander("🔍 View Parsed Data (Debug)"):
+            tab_jd, tab_cv, tab_report = st.tabs(["JD JSON", "Sample CV JSON", "Full Report"])
             
-            st.markdown("---")
-            
-            # Sample JSON
-            st.subheader("Sample Parsed JSON")
-            
-            with st.expander("📋 JD JSON"):
+            with tab_jd:
                 st.json(st.session_state.jd_json)
             
-            if sample_cv and sample_cv in st.session_state.cv_jsons:
-                with st.expander(f"📋 Sample CV JSON: {sample_cv}"):
+            with tab_cv:
+                sample_cv = list(st.session_state.cv_jsons.keys())[0] if st.session_state.cv_jsons else None
+                if sample_cv:
                     st.json(st.session_state.cv_jsons[sample_cv])
+                else:
+                    st.info("No CV data available")
             
-            st.markdown("---")
-            
-            # Full matching report
-            st.subheader("Complete Matching Report")
-            with st.expander("View Full Report JSON"):
+            with tab_report:
                 st.json(st.session_state.matching_report)
-        else:
-            st.info("Process documents to view debug information.")
+        
+        st.markdown("---")
+        
+        # Start Over button
+        if st.button("🔄 Start Over", type="secondary", use_container_width=True):
+            # Reset session state
+            init_session_state()
+            st.session_state.stage = 0
+            st.rerun()
 
 
 if __name__ == "__main__":
