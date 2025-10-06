@@ -6,3 +6,6 @@ input_test/
 groundtruth/
 issues.txt
 commands.txt
+*.pyc
+.streamlit/secrets.toml
+.DS_Store
